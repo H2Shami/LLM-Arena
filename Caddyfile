@@ -1,0 +1,132 @@
+# LLM Vibe Coding Arena - Caddy Configuration
+#
+# This handles routing for:
+# 1. Main app: main.localhost
+# 2. Preview runs: *.preview.localhost
+#
+# For local development, we use .localhost domains (no /etc/hosts needed)
+# For production, replace with your actual domain
+
+# Main app
+main.localhost {
+	reverse_proxy localhost:3000
+
+	# Add security headers
+	header {
+		X-Frame-Options "SAMEORIGIN"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer-when-downgrade"
+	}
+
+	# Enable gzip
+	encode gzip
+
+	# Logging
+	log {
+		output file /var/log/caddy/main.log {
+			roll_size 100mb
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# Preview subdomain routing
+*.preview.localhost {
+	# Extract run_id from subdomain
+	@run_id expression `{http.request.host}.matches("^([a-zA-Z0-9_-]+)\\.preview\\.localhost$")`
+
+	# For requests matching run_id pattern
+	handle @run_id {
+		# Dynamic reverse proxy
+		# Caddy will call orchestrator to resolve run_id → port
+		reverse_proxy {
+			# Call orchestrator API to get internal URL
+			dynamic http {
+				# Extract run_id from host header
+				header_regexp subdomain Host ^(?P<run_id>[a-zA-Z0-9_-]+)\.preview\.localhost$
+
+				# Query orchestrator
+				uri http://localhost:8080/gateway/resolve/{re.subdomain.run_id}
+
+				# Parse JSON response: {"url": "http://localhost:3042"}
+				# Caddy will proxy to that URL
+			}
+
+			# Preserve headers
+			header_up Host {upstream_hostport}
+			header_up X-Real-IP {remote_host}
+			header_up X-Run-ID {re.subdomain.run_id}
+
+			# Handle errors (run not found, not ready, etc.)
+			@error status 503 502 404
+			handle_response @error {
+				respond "Preview not available yet. The model may still be building." 503 {
+					close
+				}
+			}
+		}
+
+		# Security headers for previews
+		header {
+			# Allow embedding in iframes from main app
+			X-Frame-Options "SAMEORIGIN"
+			X-Content-Type-Options "nosniff"
+
+			# CSP to limit what generated sites can do
+			Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"
+
+			# Don't leak referrer
+			Referrer-Policy "no-referrer"
+
+			# Hide server info
+			-Server
+			-X-Powered-By
+		}
+
+		# Rate limiting per run
+		rate_limit {
+			zone {http.request.host} 100r/m
+		}
+
+		# Timeouts
+		@longRunning {
+			path /api/*
+		}
+		handle @longRunning {
+			# Longer timeout for API routes
+			timeouts {
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+
+		# Default timeouts
+		timeouts {
+			read_timeout 10s
+			write_timeout 10s
+		}
+
+		# Enable gzip
+		encode gzip
+
+		# Logging
+		log {
+			output file /var/log/caddy/preview.log {
+				roll_size 100mb
+				roll_keep 10
+			}
+			format json
+		}
+	}
+
+	# Fallback for invalid run IDs
+	handle {
+		respond "Invalid preview URL" 404
+	}
+}
+
+# Health check endpoint for Caddy itself
+localhost:2019 {
+	respond /health "OK" 200
+}
